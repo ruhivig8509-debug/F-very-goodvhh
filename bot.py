@@ -1,576 +1,184 @@
 """
-bot.py — Ruhi Ji Telegram Bot  🥀
-Strategy: Polling mode (reliable) + Fake HTTP server (keeps Render awake)
-Both run simultaneously via asyncio tasks.
+Ruhi Ji - Telegram Bot Main Entry Point
+Production-ready bot with PostgreSQL persistence and Hugging Face AI
 """
 
 import asyncio
 import logging
-import time
-import os
+import signal
+import sys
 from typing import Optional
 
-from aiohttp import web
-from aiogram import Bot, Dispatcher, F, Router
-from aiogram.enums import ParseMode, ChatType
-from aiogram.filters import Command, CommandStart
-from aiogram.types import Message, BotCommand, BotCommandScopeDefault
-
-import database as db
-from config import (
-    BOT_TOKEN, OWNER_ID, OWNER_USERNAME,
-    WAKE_PHRASES, SESSION_DURATION_MINUTES, RATE_LIMIT_SECONDS,
-    START_ASCII, HELP_ASCII, HF_MODEL,
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler as TelegramCommandHandler,
+    MessageHandler as TelegramMessageHandler,
+    filters,
+    ContextTypes
 )
-from llm import get_llm_reply, get_summary
 
-# ─────────────────────────────────────────────────────────────
-#  LOGGING
-# ─────────────────────────────────────────────────────────────
+from config import TELEGRAM_BOT_TOKEN, HF_TOKEN, DATABASE_URL
+from database import db
+from handlers import MessageHandler, CommandHandler, AdminCommandHandler
+from web_server import start_web_server, update_status
+
+# Configure logging
 logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s — %(message)s",
-    datefmt="%H:%M:%S",
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
 )
 logger = logging.getLogger(__name__)
 
-# Render injects PORT automatically
-PORT: int = int(os.getenv("PORT", 8080))
-
-# ─────────────────────────────────────────────────────────────
-#  BOT & DISPATCHER
-# ─────────────────────────────────────────────────────────────
-bot    = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
-dp     = Dispatcher()
-router = Router()
-dp.include_router(router)
-
-# In-memory state
-_rate_limit: dict[int, float] = {}
-_bot_active: bool = True
-_bot_id: Optional[int] = None
+# Reduce noise from libraries
+logging.getLogger('httpx').setLevel(logging.WARNING)
+logging.getLogger('telegram').setLevel(logging.WARNING)
 
 
-# ─────────────────────────────────────────────────────────────
-#  FAKE WEB SERVER  (keeps Render free tier alive)
-# ─────────────────────────────────────────────────────────────
-
-async def health(request: web.Request) -> web.Response:
-    return web.json_response({"status": "ok", "bot": "Ruhi Ji 🥀"})
-
-async def start_fake_server():
-    """Minimal aiohttp server — just to satisfy Render's port requirement."""
-    app = web.Application()
-    app.router.add_get("/",       health)
-    app.router.add_get("/health", health)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    logger.info(f"✅ Fake web server running on port {PORT}")
-
-
-# ─────────────────────────────────────────────────────────────
-#  HELPERS
-# ─────────────────────────────────────────────────────────────
-
-def _model_name() -> str:
-    return HF_MODEL.split("/")[-1]
-
-def _is_owner(user_id: int) -> bool:
-    return user_id == OWNER_ID
-
-async def _is_admin_or_owner(user_id: int) -> bool:
-    return _is_owner(user_id) or await db.is_admin(user_id)
-
-def _rate_limited(user_id: int) -> bool:
-    now  = time.time()
-    last = _rate_limit.get(user_id, 0)
-    if now - last < RATE_LIMIT_SECONDS:
-        return True
-    _rate_limit[user_id] = now
-    return False
-
-async def _contains_bad_word(text: str) -> bool:
-    return any(bw in text.lower() for bw in await db.get_bad_words())
-
-async def _ensure_user(msg: Message):
-    u = msg.from_user
-    if u:
-        await db.upsert_user(u.id, u.username or "", u.full_name or "")
-    await db.upsert_chat(msg.chat.id, msg.chat.type)
-
-def _user_display(msg: Message) -> str:
-    u = msg.from_user
-    if not u:
-        return "Koi"
-    return u.first_name or u.username or "Bhai"
-
-
-# ─────────────────────────────────────────────────────────────
-#  USER COMMANDS
-# ─────────────────────────────────────────────────────────────
-
-@router.message(CommandStart())
-async def cmd_start(msg: Message):
-    await _ensure_user(msg)
-    await msg.answer(START_ASCII.replace("{model}", _model_name()))
-
-@router.message(Command("help"))
-async def cmd_help(msg: Message):
-    await _ensure_user(msg)
-    await msg.answer(HELP_ASCII)
-
-@router.message(Command("profile"))
-async def cmd_profile(msg: Message):
-    await _ensure_user(msg)
-    u = msg.from_user
-    if not u:
-        return
-    user_row = await db.get_user(u.id)
-    if not user_row:
-        await msg.answer("Profile nahi mila yaar 😭")
-        return
-    is_own     = _is_owner(u.id)
-    is_adm     = await db.is_admin(u.id)
-    role_label = "👑 Owner" if is_own else ("🛡 Admin" if is_adm else "👤 User")
-    relation   = "Mera Owner-sama 🥺💕" if is_own else "Mera Regular User 😏"
-    await msg.answer(
-        f"╭───────────────────⦿\n"
-        f"│ 👤 <b>{u.full_name or u.username}</b>\n"
-        f"│ 🆔 <code>{u.id}</code>\n"
-        f"│ 🎭 {role_label}\n"
-        f"│ 💬 Messages: {user_row.get('msg_count', 0)}\n"
-        f"│ 🌐 Language: {user_row.get('lang_pref', 'hinglish')}\n"
-        f"│ 💞 Relation: {relation}\n"
-        f"╰───────────────────⦿"
-    )
-
-@router.message(Command(commands=["clear", "reset"]))
-async def cmd_clear(msg: Message):
-    await _ensure_user(msg)
-    await db.clear_history(msg.chat.id)
-    await db.clear_session(msg.chat.id)
-    await msg.answer("Memory clear ho gayi! ✨ Fresh start bestie 🌸")
-
-@router.message(Command("lang"))
-async def cmd_lang(msg: Message):
-    await _ensure_user(msg)
-    u = msg.from_user
-    if not u:
-        return
-    user_row = await db.get_user(u.id)
-    current  = user_row.get("lang_pref", "hinglish") if user_row else "hinglish"
-    new_lang = "hindi" if current == "hinglish" else "hinglish"
-    await db.set_user_lang(u.id, new_lang)
-    await msg.answer(f"Language switch! Ab: <b>{new_lang}</b> ✨")
-
-@router.message(Command("personality"))
-async def cmd_personality(msg: Message):
-    await _ensure_user(msg)
-    mood   = await db.get_setting("bot_mood")   or "savage"
-    active = await db.get_setting("bot_active") or "true"
-    await msg.answer(
-        f"╭───────────────────⦿\n"
-        f"│ 🎭 Mood: <b>{mood}</b>\n"
-        f"│ ⚡ Status: {'Online 🟢' if active == 'true' else 'Offline 🔴'}\n"
-        f"│ 💅 Persona: Savage Queen\n"
-        f"│ 👑 Owner: @{OWNER_USERNAME}\n"
-        f"╰───────────────────⦿"
-    )
-
-@router.message(Command(commands=["usage", "summary"]))
-async def cmd_summary(msg: Message):
-    await _ensure_user(msg)
-    history = await db.get_history(msg.chat.id, msg.chat.type)
-    summary = await get_summary(history)
-    await msg.answer(f"📋 <b>Chat Summary:</b>\n\n{summary}")
-
-
-# ─────────────────────────────────────────────────────────────
-#  ADMIN COMMANDS
-# ─────────────────────────────────────────────────────────────
-
-@router.message(Command("admin"))
-async def cmd_admin(msg: Message):
-    await _ensure_user(msg)
-    if not await _is_admin_or_owner(msg.from_user.id):
-        await msg.answer("Tu admin nahi hai beta 😂 apni aukaat mein reh 💅")
-        return
-    total      = await db.get_total_users()
-    active     = await db.get_active_users()
-    mood       = await db.get_setting("bot_mood")   or "savage"
-    bot_active = await db.get_setting("bot_active") or "true"
-    admins     = await db.get_admin_list()
-    admin_names = ", ".join(f"@{a['username']}" for a in admins if a.get("username")) or "None"
-    await msg.answer(
-        f"╭───────────────────⦿\n"
-        f"│ 👑 OWNER DASHBOARD\n"
-        f"├───────────────────⦿\n"
-        f"│ 👥 Total Users : {total}\n"
-        f"│ 🟢 Active (7d) : {active}\n"
-        f"│ 🎭 Bot Mood    : {mood}\n"
-        f"│ ⚡ Bot Active  : {bot_active}\n"
-        f"│ 🛡 Admins      : {admin_names}\n"
-        f"╰───────────────────⦿\n\n"
-        f"Use /addadmin /removeadmin /broadcast\n"
-        f"/ban /unban /forceclear /badwords\n"
-        f"/shutdown /restart /setphrase"
-    )
-
-@router.message(Command("addadmin"))
-async def cmd_addadmin(msg: Message):
-    await _ensure_user(msg)
-    if not _is_owner(msg.from_user.id):
-        await msg.answer("Sirf Owner hi admins add kar sakta hai 👑")
-        return
-    args = msg.text.split(maxsplit=1)
-    if len(args) < 2:
-        await msg.answer("Usage: /addadmin &lt;user_id&gt;")
-        return
-    try:
-        target_id  = int(args[1].strip())
-        target_row = await db.get_user(target_id)
-        username   = target_row["username"] if target_row else "unknown"
-        await db.add_admin(target_id, username)
-        await msg.answer(f"✅ <code>{target_id}</code> (@{username}) admin ban gaya! 🛡")
-    except ValueError:
-        await msg.answer("Valid user_id daal beta 😂")
-
-@router.message(Command("removeadmin"))
-async def cmd_removeadmin(msg: Message):
-    await _ensure_user(msg)
-    if not _is_owner(msg.from_user.id):
-        await msg.answer("Sirf Owner hi admins remove kar sakta hai 👑")
-        return
-    args = msg.text.split(maxsplit=1)
-    if len(args) < 2:
-        await msg.answer("Usage: /removeadmin &lt;user_id&gt;")
-        return
-    try:
-        target_id = int(args[1].strip())
-        await db.remove_admin(target_id)
-        await msg.answer(f"🗑 <code>{target_id}</code> admin se remove ho gaya")
-    except ValueError:
-        await msg.answer("Valid user_id daal beta 😂")
-
-@router.message(Command("broadcast"))
-async def cmd_broadcast(msg: Message):
-    await _ensure_user(msg)
-    if not await _is_admin_or_owner(msg.from_user.id):
-        await msg.answer("Teri aukaat nahi hai yeh command use karne ki 💅")
-        return
-    args = msg.text.split(maxsplit=1)
-    if len(args) < 2:
-        await msg.answer("Usage: /broadcast &lt;message&gt;")
-        return
-    user_ids = await db.get_all_user_ids()
-    sent, failed = 0, 0
-    for uid in user_ids:
+class RuhiJiBot:
+    """Main bot class"""
+    
+    def __init__(self):
+        self.application: Optional[Application] = None
+        self._shutdown_event = asyncio.Event()
+    
+    async def post_init(self, application: Application) -> None:
+        """Post-initialization hook"""
+        logger.info("Bot post-initialization started")
+        
+        # Connect to database
         try:
-            await bot.send_message(uid, f"📢 <b>Broadcast:</b>\n\n{args[1]}")
-            sent += 1
-            await asyncio.sleep(0.05)
-        except Exception:
-            failed += 1
-    await msg.answer(f"📢 Done! ✅ {sent} | ❌ {failed}")
-
-@router.message(Command("totalusers"))
-async def cmd_totalusers(msg: Message):
-    await _ensure_user(msg)
-    if not await _is_admin_or_owner(msg.from_user.id):
-        return
-    await msg.answer(f"👥 Total users: <b>{await db.get_total_users()}</b>")
-
-@router.message(Command("activeusers"))
-async def cmd_activeusers(msg: Message):
-    await _ensure_user(msg)
-    if not await _is_admin_or_owner(msg.from_user.id):
-        return
-    await msg.answer(f"🟢 Active (7d): <b>{await db.get_active_users()}</b>")
-
-@router.message(Command("forceclear"))
-async def cmd_forceclear(msg: Message):
-    await _ensure_user(msg)
-    if not await _is_admin_or_owner(msg.from_user.id):
-        await msg.answer("Tu admin nahi hai beta 😂")
-        return
-    args = msg.text.split(maxsplit=1)
-    if len(args) < 2:
-        await msg.answer("Usage: /forceclear &lt;user_id&gt;")
-        return
-    try:
-        target_id = int(args[1].strip())
-        await db.clear_user_history(target_id)
-        await msg.answer(f"🗑 <code>{target_id}</code> ki memory clear kar di!")
-    except ValueError:
-        await msg.answer("Valid user_id daal beta 😂")
-
-@router.message(Command("ban"))
-async def cmd_ban(msg: Message):
-    await _ensure_user(msg)
-    if not await _is_admin_or_owner(msg.from_user.id):
-        await msg.answer("Tu admin nahi hai beta 😂")
-        return
-    args = msg.text.split(maxsplit=1)
-    if len(args) < 2:
-        await msg.answer("Usage: /ban &lt;user_id&gt;")
-        return
-    try:
-        target_id = int(args[1].strip())
-        if _is_owner(target_id):
-            await msg.answer("Owner ko ban? 💀 teri himmat toh dekh 😂")
-            return
-        await db.ban_user(target_id)
-        await msg.answer(f"🚫 <code>{target_id}</code> banned! 😏")
-    except ValueError:
-        await msg.answer("Valid user_id daal beta 😂")
-
-@router.message(Command("unban"))
-async def cmd_unban(msg: Message):
-    await _ensure_user(msg)
-    if not await _is_admin_or_owner(msg.from_user.id):
-        await msg.answer("Tu admin nahi hai beta 😂")
-        return
-    args = msg.text.split(maxsplit=1)
-    if len(args) < 2:
-        await msg.answer("Usage: /unban &lt;user_id&gt;")
-        return
-    try:
-        target_id = int(args[1].strip())
-        await db.unban_user(target_id)
-        await msg.answer(f"✅ <code>{target_id}</code> unban ho gaya! 🥀")
-    except ValueError:
-        await msg.answer("Valid user_id daal beta 😂")
-
-@router.message(Command("badwords"))
-async def cmd_badwords(msg: Message):
-    await _ensure_user(msg)
-    if not await _is_admin_or_owner(msg.from_user.id):
-        return
-    words = await db.get_bad_words()
-    if not words:
-        await msg.answer("📋 Bad words list empty hai ✨")
-        return
-    await msg.answer(f"📋 <b>Bad Words:</b>\n<code>{', '.join(words)}</code>")
-
-@router.message(Command("addbadword"))
-async def cmd_addbadword(msg: Message):
-    await _ensure_user(msg)
-    if not await _is_admin_or_owner(msg.from_user.id):
-        return
-    args = msg.text.split(maxsplit=1)
-    if len(args) < 2:
-        await msg.answer("Usage: /addbadword &lt;word&gt;")
-        return
-    word = args[1].strip().lower()
-    await db.add_bad_word(word)
-    await msg.answer(f"✅ '<code>{word}</code>' add ho gaya 🚫")
-
-@router.message(Command("removebadword"))
-async def cmd_removebadword(msg: Message):
-    await _ensure_user(msg)
-    if not await _is_admin_or_owner(msg.from_user.id):
-        return
-    args = msg.text.split(maxsplit=1)
-    if len(args) < 2:
-        await msg.answer("Usage: /removebadword &lt;word&gt;")
-        return
-    word = args[1].strip().lower()
-    await db.remove_bad_word(word)
-    await msg.answer(f"🗑 '<code>{word}</code>' remove ho gaya ✨")
-
-@router.message(Command("setphrase"))
-async def cmd_setphrase(msg: Message):
-    await _ensure_user(msg)
-    if not await _is_admin_or_owner(msg.from_user.id):
-        return
-    args = msg.text.split(maxsplit=1)
-    if len(args) < 2:
-        await msg.answer(
-            "Usage: /setphrase mood:&lt;value&gt;\n"
-            "Moods: savage | happy | sad | flirty | chill"
+            await db.connect()
+            logger.info("Database connected successfully")
+        except Exception as e:
+            logger.error(f"Database connection failed: {e}")
+            raise
+        
+        update_status("running")
+        logger.info("Ruhi Ji Bot is now running! 👑")
+    
+    async def post_shutdown(self, application: Application) -> None:
+        """Post-shutdown hook"""
+        logger.info("Bot shutting down...")
+        await db.disconnect()
+        update_status("stopped")
+        logger.info("Bot shutdown complete")
+    
+    def setup_handlers(self, application: Application) -> None:
+        """Setup all command and message handlers"""
+        
+        # User Commands
+        application.add_handler(TelegramCommandHandler("start", CommandHandler.start))
+        application.add_handler(TelegramCommandHandler("help", CommandHandler.help_command))
+        application.add_handler(TelegramCommandHandler("profile", CommandHandler.profile))
+        application.add_handler(TelegramCommandHandler("clear", CommandHandler.clear))
+        application.add_handler(TelegramCommandHandler("reset", CommandHandler.clear))
+        application.add_handler(TelegramCommandHandler("lang", CommandHandler.lang))
+        application.add_handler(TelegramCommandHandler("personality", CommandHandler.personality))
+        application.add_handler(TelegramCommandHandler("usage", CommandHandler.usage))
+        application.add_handler(TelegramCommandHandler("summary", CommandHandler.summary))
+        
+        # Admin Commands
+        application.add_handler(TelegramCommandHandler("admin", AdminCommandHandler.admin))
+        application.add_handler(TelegramCommandHandler("broadcast", AdminCommandHandler.broadcast))
+        application.add_handler(TelegramCommandHandler("totalusers", AdminCommandHandler.totalusers))
+        application.add_handler(TelegramCommandHandler("activeusers", AdminCommandHandler.activeusers))
+        application.add_handler(TelegramCommandHandler("forceclear", AdminCommandHandler.forceclear))
+        application.add_handler(TelegramCommandHandler("ban", AdminCommandHandler.ban))
+        application.add_handler(TelegramCommandHandler("unban", AdminCommandHandler.unban))
+        application.add_handler(TelegramCommandHandler("badwords", AdminCommandHandler.badwords))
+        application.add_handler(TelegramCommandHandler("addbadword", AdminCommandHandler.addbadword))
+        application.add_handler(TelegramCommandHandler("removebadword", AdminCommandHandler.removebadword))
+        
+        # Message handler (must be added last)
+        application.add_handler(TelegramMessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            MessageHandler.handle_message
+        ))
+        
+        # Error handler
+        application.add_error_handler(self.error_handler)
+        
+        logger.info("All handlers registered successfully")
+    
+    async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle errors"""
+        logger.error(f"Exception while handling an update: {context.error}")
+        
+        # Try to notify user
+        if update and update.effective_message:
+            try:
+                await update.effective_message.reply_text(
+                    "Oops! Kuch gadbad ho gayi 🥺 Please try again later 💕"
+                )
+            except Exception:
+                pass
+    
+    def run(self) -> None:
+        """Start the bot"""
+        # Validate configuration
+        if not TELEGRAM_BOT_TOKEN:
+            logger.error("TELEGRAM_BOT_TOKEN not set!")
+            sys.exit(1)
+        
+        if not HF_TOKEN:
+            logger.error("HF_TOKEN not set!")
+            sys.exit(1)
+        
+        if not DATABASE_URL:
+            logger.error("DATABASE_URL not set!")
+            sys.exit(1)
+        
+        # Start web server for Render health checks
+        start_web_server()
+        update_status("starting")
+        
+        # Build application
+        self.application = (
+            Application.builder()
+            .token(TELEGRAM_BOT_TOKEN)
+            .post_init(self.post_init)
+            .post_shutdown(self.post_shutdown)
+            .build()
         )
-        return
-    parts = args[1].strip()
-    if parts.startswith("mood:"):
-        new_mood = parts.split("mood:", 1)[1].strip()
-        await db.set_setting("bot_mood", new_mood)
-        await msg.answer(f"✅ Mood → <b>{new_mood}</b> 🎭")
-    else:
-        await msg.answer("Format: /setphrase mood:&lt;value&gt;")
-
-@router.message(Command("shutdown"))
-async def cmd_shutdown(msg: Message):
-    global _bot_active
-    await _ensure_user(msg)
-    if not await _is_admin_or_owner(msg.from_user.id):
-        await msg.answer("Tu admin nahi hai beta 😂")
-        return
-    _bot_active = False
-    await db.set_setting("bot_active", "false")
-    await msg.answer("😴 Ruhi Ji so gayi... /restart se jagaao")
-
-@router.message(Command("restart"))
-async def cmd_restart(msg: Message):
-    global _bot_active
-    await _ensure_user(msg)
-    if not await _is_admin_or_owner(msg.from_user.id):
-        await msg.answer("Tu admin nahi hai beta 😂")
-        return
-    _bot_active = True
-    await db.set_setting("bot_active", "true")
-    await msg.answer("✨ Ruhi Ji waapas! Kya missed kiya mujhe? 😏")
+        
+        # Setup handlers
+        self.setup_handlers(self.application)
+        
+        # Run the bot
+        logger.info("Starting Ruhi Ji Bot... 👑")
+        
+        # Use run_polling with proper shutdown handling
+        self.application.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+            close_loop=False
+        )
 
 
-# ─────────────────────────────────────────────────────────────
-#  MAIN MESSAGE HANDLER
-# ─────────────────────────────────────────────────────────────
-
-@router.message(F.text)
-async def handle_message(msg: Message):
-    global _bot_active, _bot_id
-
-    if not msg.from_user or not msg.text:
-        return
-
-    await _ensure_user(msg)
-
-    user_id    = msg.from_user.id
-    chat_id    = msg.chat.id
-    chat_type  = msg.chat.type
-    text       = msg.text.strip()
-    text_lower = text.lower()
-
-    if not _bot_active and not _is_owner(user_id):
-        return
-    if await db.is_banned(user_id):
-        return
-    if await _contains_bad_word(text):
-        await msg.reply("Yeh sab mat bola kar yaar 🚫 thoda tameez seekh 💅")
-        return
-
-    is_private      = chat_type == ChatType.PRIVATE
-    is_reply_to_bot = (
-        msg.reply_to_message
-        and msg.reply_to_message.from_user
-        and msg.reply_to_message.from_user.id == _bot_id
-    )
-    wake_triggered = any(phrase in text_lower for phrase in WAKE_PHRASES)
-
-    should_reply = False
-    if is_private:
-        should_reply = True
-    elif is_reply_to_bot:
-        should_reply = True
-    elif wake_triggered:
-        should_reply = True
-        await db.set_session(chat_id, SESSION_DURATION_MINUTES)
-    elif await db.is_session_active(chat_id):
-        should_reply = True
-
-    if not should_reply:
-        return
-    if _rate_limited(user_id):
-        return
-
-    await db.add_message(chat_id, user_id, "user", text)
-    await db.increment_msg_count(user_id)
-
-    history   = await db.get_history(chat_id, chat_type)
-    bot_mood  = await db.get_setting("bot_mood") or "savage"
-    user_name = _user_display(msg)
-
-    await bot.send_chat_action(chat_id, "typing")
-
-    reply_text = await get_llm_reply(
-        user_msg=text,
-        history=history[:-1],
-        is_owner=_is_owner(user_id),
-        user_name=user_name,
-        bot_mood=bot_mood,
-    )
-
-    await db.add_message(chat_id, None, "assistant", reply_text)
-    await msg.reply(reply_text)
-
-
-# ─────────────────────────────────────────────────────────────
-#  BOT COMMANDS REGISTRATION
-# ─────────────────────────────────────────────────────────────
-
-async def set_bot_commands():
-    commands = [
-        BotCommand(command="start",         description="Ruhi Ji ko wake up karo 🌸"),
-        BotCommand(command="help",          description="Help menu dekho"),
-        BotCommand(command="profile",       description="Apna profile dekho"),
-        BotCommand(command="clear",         description="Memory clear karo"),
-        BotCommand(command="reset",         description="Context reset karo"),
-        BotCommand(command="lang",          description="Language toggle"),
-        BotCommand(command="personality",   description="Bot ka mood dekho"),
-        BotCommand(command="usage",         description="Chat summary lo"),
-        BotCommand(command="summary",       description="Chat summary lo"),
-        BotCommand(command="admin",         description="[Admin] Dashboard"),
-        BotCommand(command="addadmin",      description="[Admin] Admin add karo"),
-        BotCommand(command="removeadmin",   description="[Admin] Admin remove karo"),
-        BotCommand(command="broadcast",     description="[Admin] Sab ko message bhejo"),
-        BotCommand(command="ban",           description="[Admin] User ban karo"),
-        BotCommand(command="unban",         description="[Admin] User unban karo"),
-        BotCommand(command="totalusers",    description="[Admin] Total users dekho"),
-        BotCommand(command="activeusers",   description="[Admin] Active users dekho"),
-        BotCommand(command="forceclear",    description="[Admin] Kisi ki memory clear karo"),
-        BotCommand(command="badwords",      description="[Admin] Bad words list dekho"),
-        BotCommand(command="addbadword",    description="[Admin] Bad word add karo"),
-        BotCommand(command="removebadword", description="[Admin] Bad word remove karo"),
-        BotCommand(command="setphrase",     description="[Admin] Bot mood set karo"),
-        BotCommand(command="shutdown",      description="[Admin] Bot sulate jao"),
-        BotCommand(command="restart",       description="[Admin] Bot jagao"),
-    ]
-    await bot.set_my_commands(commands, scope=BotCommandScopeDefault())
-
-
-# ─────────────────────────────────────────────────────────────
-#  STARTUP
-# ─────────────────────────────────────────────────────────────
-
-async def main():
-    global _bot_active, _bot_id
-
-    logger.info("🚀 Starting Ruhi Ji Bot...")
-
-    # 1. Start fake web server FIRST (so Render sees port open immediately)
-    await start_fake_server()
-
-    # 2. Connect to database
-    await db.create_pool()
-
-    # 3. Restore bot_active from DB
-    saved_active = await db.get_setting("bot_active")
-    _bot_active  = (saved_active != "false")
-
-    # 4. Register bot commands
-    await set_bot_commands()
-
-    # 5. Cache bot ID
-    me      = await bot.get_me()
-    _bot_id = me.id
-    logger.info(f"✅ Bot ready: @{me.username} (id={me.id})")
-
-    # 6. Notify owner
-    if OWNER_ID:
-        try:
-            await bot.send_message(
-                OWNER_ID,
-                "✨ Ruhi Ji online ho gayi hai Owner-sama! 🥺💕\n"
-                "/admin se dashboard dekho."
-            )
-        except Exception:
-            pass
-
-    # 7. Start polling (runs forever)
-    logger.info("🔄 Starting polling...")
-    await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
+def main():
+    """Main entry point"""
+    bot = RuhiJiBot()
+    
+    # Handle graceful shutdown
+    def signal_handler(signum, frame):
+        logger.info("Received shutdown signal")
+        sys.exit(0)
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    try:
+        bot.run()
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.error(f"Bot crashed: {e}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
