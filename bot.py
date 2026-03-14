@@ -1,6 +1,7 @@
 """
 bot.py — Ruhi Ji Telegram Bot  🥀
-Webhook mode + aiohttp server — optimised for Render Free Web Service
+Strategy: Polling mode (reliable) + Fake HTTP server (keeps Render awake)
+Both run simultaneously via asyncio tasks.
 """
 
 import asyncio
@@ -9,12 +10,11 @@ import time
 import os
 from typing import Optional
 
-from aiohttp import web, ClientSession
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ParseMode, ChatType
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message, BotCommand, BotCommandScopeDefault
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 import database as db
 from config import (
@@ -34,16 +34,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ─────────────────────────────────────────────────────────────
-#  WEBHOOK / SERVER CONFIG
-# ─────────────────────────────────────────────────────────────
-# Render injects PORT automatically; 8080 for local testing
+# Render injects PORT automatically
 PORT: int = int(os.getenv("PORT", 8080))
-
-# Render sets this automatically — e.g. https://ruhi-ji-bot.onrender.com
-WEBHOOK_BASE: str = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
-WEBHOOK_PATH: str = f"/webhook/{BOT_TOKEN}"
-WEBHOOK_URL:  str = f"{WEBHOOK_BASE}{WEBHOOK_PATH}"
 
 # ─────────────────────────────────────────────────────────────
 #  BOT & DISPATCHER
@@ -56,7 +48,26 @@ dp.include_router(router)
 # In-memory state
 _rate_limit: dict[int, float] = {}
 _bot_active: bool = True
-_bot_id: Optional[int] = None   # cached at startup
+_bot_id: Optional[int] = None
+
+
+# ─────────────────────────────────────────────────────────────
+#  FAKE WEB SERVER  (keeps Render free tier alive)
+# ─────────────────────────────────────────────────────────────
+
+async def health(request: web.Request) -> web.Response:
+    return web.json_response({"status": "ok", "bot": "Ruhi Ji 🥀"})
+
+async def start_fake_server():
+    """Minimal aiohttp server — just to satisfy Render's port requirement."""
+    app = web.Application()
+    app.router.add_get("/",       health)
+    app.router.add_get("/health", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logger.info(f"✅ Fake web server running on port {PORT}")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -485,33 +496,6 @@ async def handle_message(msg: Message):
 
 
 # ─────────────────────────────────────────────────────────────
-#  SELF-PING  (keeps Render free tier awake every 10 min)
-# ─────────────────────────────────────────────────────────────
-
-async def self_ping_loop():
-    """Ping /health every 10 min so Render doesn't put the service to sleep."""
-    await asyncio.sleep(30)   # let server fully start first
-    async with ClientSession() as session:
-        while True:
-            try:
-                url = f"{WEBHOOK_BASE}/health"
-                async with session.get(url, timeout=10) as resp:
-                    logger.info(f"Self-ping → {resp.status}")
-            except Exception as e:
-                logger.warning(f"Self-ping failed: {e}")
-            await asyncio.sleep(600)   # 10 minutes
-
-
-# ─────────────────────────────────────────────────────────────
-#  AIOHTTP ROUTES
-# ─────────────────────────────────────────────────────────────
-
-async def health_handler(request: web.Request) -> web.Response:
-    """Health check endpoint — Render pings this to detect liveness."""
-    return web.json_response({"status": "ok", "bot": "Ruhi Ji 🥀"})
-
-
-# ─────────────────────────────────────────────────────────────
 #  BOT COMMANDS REGISTRATION
 # ─────────────────────────────────────────────────────────────
 
@@ -546,64 +530,33 @@ async def set_bot_commands():
 
 
 # ─────────────────────────────────────────────────────────────
-#  STARTUP VALIDATION
+#  STARTUP
 # ─────────────────────────────────────────────────────────────
 
-def _validate_config():
-    missing = []
-    if not BOT_TOKEN:
-        missing.append("BOT_TOKEN")
-    if not OWNER_ID:
-        missing.append("OWNER_ID")
-    if not WEBHOOK_BASE:
-        missing.append("RENDER_EXTERNAL_URL")
-    if missing:
-        raise EnvironmentError(
-            f"❌ Missing env vars: {', '.join(missing)}\n"
-            "   Copy .env.example → .env and fill values."
-        )
-    import config as cfg
-    if not cfg.HF_TOKEN:
-        logger.warning("⚠️  HF_TOKEN not set — LLM replies will fail!")
-    if not cfg.DATABASE_URL:
-        raise EnvironmentError("❌ DATABASE_URL not set.")
-
-
-# ─────────────────────────────────────────────────────────────
-#  STARTUP / SHUTDOWN LIFECYCLE
-# ─────────────────────────────────────────────────────────────
-
-async def on_startup(app: web.Application):
+async def main():
     global _bot_active, _bot_id
 
-    _validate_config()
-    logger.info("🚀 Starting Ruhi Ji Bot (webhook mode)...")
+    logger.info("🚀 Starting Ruhi Ji Bot...")
 
+    # 1. Start fake web server FIRST (so Render sees port open immediately)
+    await start_fake_server()
+
+    # 2. Connect to database
     await db.create_pool()
 
-    # Restore active state from DB (survives redeploys)
+    # 3. Restore bot_active from DB
     saved_active = await db.get_setting("bot_active")
     _bot_active  = (saved_active != "false")
 
+    # 4. Register bot commands
     await set_bot_commands()
 
-    # Register webhook with Telegram
-    await bot.set_webhook(
-        url=WEBHOOK_URL,
-        drop_pending_updates=True,
-        allowed_updates=["message", "callback_query"],
-    )
-    logger.info(f"✅ Webhook registered → {WEBHOOK_URL}")
-
+    # 5. Cache bot ID
     me      = await bot.get_me()
     _bot_id = me.id
     logger.info(f"✅ Bot ready: @{me.username} (id={me.id})")
 
-    # Launch self-ping background task
-    asyncio.create_task(self_ping_loop())
-    logger.info("✅ Self-ping loop started (every 10 min)")
-
-    # Notify owner
+    # 6. Notify owner
     if OWNER_ID:
         try:
             await bot.send_message(
@@ -614,36 +567,10 @@ async def on_startup(app: web.Application):
         except Exception:
             pass
 
-
-async def on_shutdown(app: web.Application):
-    logger.info("Shutting down Ruhi Ji Bot...")
-    await bot.delete_webhook()
-    await db.close_pool()
-    await bot.session.close()
-
-
-# ─────────────────────────────────────────────────────────────
-#  ENTRY POINT
-# ─────────────────────────────────────────────────────────────
-
-def main():
-    app = web.Application()
-
-    # Health + root route (Render health checks)
-    app.router.add_get("/",       health_handler)
-    app.router.add_get("/health", health_handler)
-
-    # Telegram webhook route
-    SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
-    setup_application(app, dp, bot=bot)
-
-    # Lifecycle hooks
-    app.on_startup.append(on_startup)
-    app.on_shutdown.append(on_shutdown)
-
-    logger.info(f"🌐 Web server on port {PORT}")
-    web.run_app(app, host="0.0.0.0", port=PORT)
+    # 7. Start polling (runs forever)
+    logger.info("🔄 Starting polling...")
+    await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
