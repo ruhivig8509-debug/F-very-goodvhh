@@ -1,6 +1,6 @@
 """
 database.py — Ruhi Ji Bot
-PostgreSQL via asyncpg (NeonDB / Pella-safe)
+PostgreSQL via asyncpg (NeonDB compatible)
 """
 
 import asyncio
@@ -97,17 +97,17 @@ async def _create_tables():
             );
 
             CREATE TABLE IF NOT EXISTS chats (
-                chat_id              BIGINT PRIMARY KEY,
-                chat_type            TEXT,
+                chat_id               BIGINT PRIMARY KEY,
+                chat_type             TEXT,
                 active_session_expiry TIMESTAMP,
-                created_at           TIMESTAMP DEFAULT NOW()
+                created_at            TIMESTAMP DEFAULT NOW()
             );
 
             CREATE TABLE IF NOT EXISTS messages (
                 id           SERIAL PRIMARY KEY,
                 chat_id      BIGINT   NOT NULL,
                 user_id      BIGINT,
-                role         TEXT     NOT NULL,    -- 'user' | 'assistant'
+                role         TEXT     NOT NULL,
                 message_text TEXT     NOT NULL,
                 timestamp    TIMESTAMP DEFAULT NOW()
             );
@@ -123,10 +123,10 @@ async def _create_tables():
         # Seed default settings
         await conn.execute("""
             INSERT INTO settings (key, value) VALUES
-                ('bad_words', ''),
-                ('bot_mood',  'savage'),
-                ('bot_active', 'true'),
-                ('trigger_phrase', 'ruhi ji')
+                ('bad_words',     ''),
+                ('bot_mood',      'savage'),
+                ('bot_active',    'true'),
+                ('trigger_phrase','ruhi ji')
             ON CONFLICT (key) DO NOTHING;
         """)
 
@@ -176,9 +176,11 @@ async def get_total_users() -> int:
 
 
 async def get_active_users(days: int = 7) -> int:
+    # FIX: was missing $1 param, always used hardcoded 7 days
+    cutoff = datetime.utcnow() - timedelta(days=days)
     return await _execute(
-        "SELECT COUNT(*) FROM users WHERE last_seen > NOW() - INTERVAL '7 days'",
-        fetch="val"
+        "SELECT COUNT(*) FROM users WHERE last_seen > $1",
+        cutoff, fetch="val"
     ) or 0
 
 

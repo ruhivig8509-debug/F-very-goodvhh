@@ -6,27 +6,23 @@ load_dotenv()
 # ─────────────────────────────────────────────
 #  TELEGRAM
 # ─────────────────────────────────────────────
-BOT_TOKEN: str = os.getenv("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
+BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
 
 # ─────────────────────────────────────────────
-#  OWNER  (fill OWNER_ID after /start once)
+#  OWNER
 # ─────────────────────────────────────────────
 OWNER_USERNAME: str = "RUHI_VIG_QNR"
-OWNER_ID: int = int(os.getenv("OWNER_ID", "0"))          # set in .env
+OWNER_ID: int = int(os.getenv("OWNER_ID", "0"))
 
 # ─────────────────────────────────────────────
-#  DATABASE  (NeonDB — place in .env for safety)
+#  DATABASE  (NeonDB — set in .env / Render env)
 # ─────────────────────────────────────────────
-DATABASE_URL: str = os.getenv(
-    "DATABASE_URL",
-    "postgresql://neondb_owner:npg_jYrNzuqFA0i8@ep-wispy-silence-a1lpucgo-pooler"
-    ".ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require",
-)
+DATABASE_URL: str = os.getenv("DATABASE_URL", "")
 
 # ─────────────────────────────────────────────
 #  LLM — HuggingFace Router → Kimi-K2 via Groq
 # ─────────────────────────────────────────────
-HF_TOKEN: str    = os.getenv("HF_TOKEN", "")   # Set in Render env vars
+HF_TOKEN: str    = os.getenv("HF_TOKEN", "")
 HF_BASE_URL: str = "https://router.huggingface.co/v1"
 HF_MODEL: str    = "moonshotai/Kimi-K2-Instruct-0905:groq"
 
@@ -38,7 +34,7 @@ SESSION_DURATION_MINUTES: int = 10
 GROUP_MEMORY_SIZE: int = 20
 PRIVATE_MEMORY_SIZE: int = 50
 RATE_LIMIT_SECONDS: int = 3
-MAX_LLM_CONTEXT_CHARS: int = 12_000    # hard cap before FIFO trim
+MAX_LLM_CONTEXT_CHARS: int = 12_000
 LLM_MAX_TOKENS: int = 512
 
 # ─────────────────────────────────────────────
