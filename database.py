@@ -130,6 +130,26 @@ async def _create_tables():
             ON CONFLICT (key) DO NOTHING;
         """)
 
+        # ── MIGRATIONS — safely add missing columns to existing tables ──
+        migrations = [
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS username   TEXT",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS full_name  TEXT",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS role       TEXT    DEFAULT 'user'",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS lang_pref  TEXT    DEFAULT 'hinglish'",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_banned  BOOLEAN DEFAULT FALSE",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS msg_count  INTEGER DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS first_seen TIMESTAMP DEFAULT NOW()",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen  TIMESTAMP DEFAULT NOW()",
+            "ALTER TABLE admins ADD COLUMN IF NOT EXISTS username  TEXT",
+            "ALTER TABLE admins ADD COLUMN IF NOT EXISTS added_at  TIMESTAMP DEFAULT NOW()",
+            "ALTER TABLE chats ADD COLUMN IF NOT EXISTS chat_type             TEXT",
+            "ALTER TABLE chats ADD COLUMN IF NOT EXISTS active_session_expiry TIMESTAMP",
+            "ALTER TABLE chats ADD COLUMN IF NOT EXISTS created_at            TIMESTAMP DEFAULT NOW()",
+        ]
+        for sql in migrations:
+            await conn.execute(sql)
+        logger.info("✅ DB migrations applied.")
+
 
 # ─────────────────────────────────────────────────────────────
 #  USER HELPERS
