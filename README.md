@@ -1,118 +1,76 @@
-# 🥀 Ruhi Ji — Telegram Bot
+# 🌸 Ruhi Ji — Savage Queen Telegram Bot
 
-> Savage Queen 👑 | Hinglish Gen-Z | Kimi-K2 via HuggingFace | PostgreSQL Memory
+A dual-personality AI chatbot powered by Kimi-K2-Instruct via Hugging Face Router API,
+with persistent PostgreSQL memory, deployed on Render.com.
 
----
+## Setup Instructions
 
-## 📁 Files
+### 1. Prerequisites
+- Python 3.10+
+- PostgreSQL database (Neon.tech recommended)
+- Telegram Bot Token (from @BotFather)
+- Hugging Face API Token
 
+### 2. Environment Variables
+
+Create a `.env` file (for local development) or set these in Render's dashboard:
+
+```env
+TELEGRAM_BOT_TOKEN=your_bot_token
+HF_TOKEN=your_huggingface_token
+DATABASE_URL=postgresql://user:pass@host/dbname?sslmode=require
+OWNER_USERNAME=RUHI_VIG_QNR
+PORT=10000
 ```
-ruhi_ji_bot/
-├── bot.py           ← Main bot (webhook mode + aiohttp server)
-├── database.py      ← PostgreSQL helpers (NeonDB)
-├── llm.py           ← Kimi-K2 caller via HF Router
-├── config.py        ← Constants + ASCII UI
-├── requirements.txt ← 5 deps (aiohttp added)
-├── render.yaml      ← Render Web Service config
-└── .env.example     ← Copy → .env and fill secrets
-```
 
----
+> ⚠️ **SECURITY**: Never commit `.env` or credentials to version control.
+> Add `.env` to your `.gitignore`.
 
-## 🚀 Render Free Web Service Deploy
+### 3. Local Development
 
-### Step 1 — GitHub pe push karo
 ```bash
-git init
-git add .
-git commit -m "Ruhi Ji Bot 🥀"
-git remote add origin https://github.com/YOUR_USERNAME/ruhi-ji-bot.git
-git push -u origin main
+pip install -r requirements.txt
+python bot.py
 ```
 
-### Step 2 — Render Dashboard
-1. [render.com](https://render.com) pe login karo
-2. **New +** → **Web Service** → apna GitHub repo select karo
-3. Settings:
-   - **Name:** `ruhi-ji-bot`
-   - **Runtime:** `Python 3`
-   - **Build Command:** `pip install -r requirements.txt`
-   - **Start Command:** `python bot.py`
-   - **Instance Type:** `Free`
+### 4. Deploy to Render
 
-### Step 3 — Environment Variables
-Render dashboard → **Environment** tab mein yeh variables add karo:
+1. Push code to a GitHub repository
+2. Create a **Web Service** on Render
+3. Set **Build Command**: `pip install -r requirements.txt`
+4. Set **Start Command**: `python bot.py`
+5. Add all environment variables in Render's Environment tab
+6. Deploy!
 
-| Key | Value |
-|-----|-------|
-| `BOT_TOKEN` | @BotFather se mila token |
-| `OWNER_ID` | Tera Telegram numeric ID (@userinfobot se lo) |
-| `HF_TOKEN` | huggingface.co/settings/tokens se lo |
-| `DATABASE_URL` | NeonDB connection string |
+### 5. Keep-Alive (UptimeRobot)
 
-> ⚠️ `RENDER_EXTERNAL_URL` **manually add karne ki zaroorat NAHI** — Render khud set karta hai.
+Since Render's free tier spins down after 15 minutes of inactivity:
+1. Sign up at [UptimeRobot](https://uptimerobot.com)
+2. Add a new HTTP monitor pointing to your Render URL's `/health` endpoint
+3. Set check interval to 5 minutes
 
-### Step 4 — Deploy!
-**Save Changes** → Render build + deploy karega.
+## Architecture
 
-Logs mein yeh dikhega:
 ```
-✅ Database connected successfully.
-✅ Webhook registered → https://ruhi-ji-bot.onrender.com/webhook/...
-✅ Bot ready: @YourBotUsername
-✅ Self-ping loop started (every 10 min)
+┌─────────────┐     ┌──────────────┐     ┌─────────────────┐
+│  Telegram    │────▶│   bot.py     │────▶│  Hugging Face   │
+│  Users       │◀────│  (handlers)  │◀────│  Router API     │
+└─────────────┘     └──────┬───────┘     └─────────────────┘
+                           │
+                    ┌──────▼───────┐
+                    │  PostgreSQL  │
+                    │  (Neon.tech) │
+                    └──────────────┘
 ```
 
----
+## Features
+- 🧠 Dual personality (Sweet for Owner, Savage for others)
+- 💾 Persistent memory (20 msgs group / 50 msgs private)
+- 🗣️ Wake phrase activation ("Ruhi Ji")
+- 👑 Full admin dashboard
+- 🚫 Bad word filtering
+- 📢 Broadcast system
+- 🏥 Health check endpoint for Render
 
-## 🤖 Model Info
-
-| Setting | Value |
-|---------|-------|
-| Provider | HuggingFace Router |
-| Model | `moonshotai/Kimi-K2-Instruct-0905:groq` |
-| Backend | Groq (fast inference) |
-| Library | `openai` Python SDK |
-
----
-
-## 💬 How It Works
-
-| Feature | Detail |
-|---------|--------|
-| Mode | Webhook (Render Web Service) |
-| Wake Phrase | "Ruhi Ji" → 10 min group session |
-| Private DM | Always replies, 50 msg memory |
-| Group | Only when woken, 20 msg memory |
-| Owner Mode | Cute + obedient for @RUHI_VIG_QNR |
-| User Mode | Savage roast queen 😏 |
-| Rate Limit | 3 sec per user |
-| Self-Ping | Every 10 min to keep Render awake |
-| Sleep Fix | `/health` endpoint prevents free tier sleep |
-
----
-
-## 📋 Commands
-
-**User:**
-`/start` `/help` `/profile` `/clear` `/reset` `/lang` `/personality` `/usage` `/summary`
-
-**Admin:**
-`/admin` `/addadmin` `/removeadmin` `/broadcast` `/ban` `/unban`
-`/totalusers` `/activeusers` `/forceclear` `/badwords` `/addbadword`
-`/removebadword` `/setphrase` `/shutdown` `/restart`
-
----
-
-## 🔧 Why Webhook Instead of Polling?
-
-Render Free Web Service **sone lagta hai** jab koi HTTP request nahi aata.
-Polling mode mein bot khud requests karta hai — sleep hote hi band ho jaata hai.
-
-Webhook mode mein **Telegram messages directly** Render ke server pe aate hain,
-isliye server **always active** rehta hai jab messages aa rahe hain.
-Self-ping loop additional guarantee deta hai ki service soye nahi.
-
----
-
-Made with 💅 by @RUHI_VIG_QNR
+## License
+MIT
